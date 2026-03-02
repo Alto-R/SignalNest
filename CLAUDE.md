@@ -37,7 +37,7 @@ cd docker/
 # First run / after code changes
 docker compose up -d --build
 
-# After editing config.yaml or personal/*.yaml only
+# After editing config.yaml or personal/*.md only
 docker compose restart
 
 # After changing .env
@@ -64,8 +64,9 @@ There are no automated tests in this project.
 main.py::run()
   │
   ├─ personal/  (if content_blocks includes "schedule"/"todos")
-  │   ├── schedule_reader.py  → reads config/personal/schedule.yaml
-  │   └── todo_reader.py      → reads config/personal/todos.yaml
+  │   └── ai_reader.py  → reads config/personal/schedule.md  (read_today_schedule)
+  │                        reads config/personal/projects.md  (read_active_projects)
+  │                        uses AI to parse free-form Markdown; returns structured dicts
   │
   ├─ collectors/  (if content_blocks includes "news")
   │   ├── github_collector.py  → scrapes github.com/trending
@@ -76,7 +77,8 @@ main.py::run()
   │   ├─ Stage 1: batch title filtering (1 LiteLLM call)
   │   ├─ [YouTube only] fetch transcripts for shortlisted videos
   │   ├─ [RSS only] cap per-feed candidates
-  │   └─ Stage 2: per-item score + summary (N LiteLLM calls)
+  │   ├─ Stage 2: per-item score + summary (N parallel LiteLLM calls)
+  │   └─ generate_digest_summary() → 1 extra call for "今日要点" bullet list
   │
   ├─ ai/feedback.py  → SQLite feedback.db, taste examples for few-shot
   │
@@ -105,7 +107,16 @@ main.py::run()
 
 ### AI model configuration
 
-Uses LiteLLM — supports any OpenAI-compatible API. Model format is `provider/model_name` (e.g. `openai/gpt-4o`, `gemini/gemini-2.0-flash`). Set `AI_API_BASE` for proxy/relay endpoints.
+Uses LiteLLM by default — supports any OpenAI-compatible API. Model format is `provider/model_name` (e.g. `openai/gpt-4o`, `gemini/gemini-2.0-flash`). Set `AI_API_BASE` for proxy/relay endpoints.
+
+Three backends are supported via `AI_BACKEND` env var or `ai.backend` in config:
+- `litellm` (default): calls cloud APIs via LiteLLM; requires `AI_API_KEY`
+- `claude-cli`: calls the local `claude --print` CLI tool (Claude Code CLI); no API key needed
+- `codex-cli`: calls the local `codex -q` CLI tool (OpenAI Codex CLI); no API key needed
+
+### Personal files format
+
+`config/personal/schedule.md` and `config/personal/projects.md` support **any free-form Markdown** — tables, checklists, natural language, course schedules. `ai_reader.py` uses an LLM call to parse them into structured JSON. Example files are in `config/personal/*_example.md`.
 
 ### Feedback / preference learning loop
 
@@ -130,7 +141,9 @@ Each run saves `data/last_digest.json`. Users can fill in `user_score` (1-5) on 
 | `src/main.py` | Top-level orchestrator — the entry point |
 | `src/config_loader.py` | Merges `config.yaml` + `.env` into a single config dict |
 | `src/ai/summarizer.py` | Two-stage AI filtering engine (core logic, most complex file) |
+| `src/ai/cli_backend.py` | Unified AI call entry point: LiteLLM or local CLI (`claude`/`codex`) |
 | `src/ai/feedback.py` | SQLite feedback store + taste example loader |
+| `src/personal/ai_reader.py` | AI-powered parser for `schedule.md` and `projects.md` |
 | `src/notifications/dispatcher.py` | Routes payload to enabled notification channels |
 | `config/config.yaml` | Primary user-facing configuration |
 | `docker/.env` | Secrets (never commit) |
