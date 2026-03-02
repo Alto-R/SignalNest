@@ -45,6 +45,17 @@ class YouTubeClient:
         return self.get("search", **params)
 
 
+def _normalize_sort_by(value: str, field_name: str, default: str = "views") -> str:
+    """
+    规范化排序方式，当前仅支持 views / date。
+    """
+    raw = (value or "").strip().lower()
+    if raw in {"views", "date"}:
+        return raw
+    logger.warning(f"{field_name}={value!r} 非法，回退为 {default!r}")
+    return default
+
+
 def _get_transcript(video_id: str, max_chars: int = 2000) -> str:
     """拉取视频字幕（供 summarizer 阶段一筛选后调用）。"""
     try:
@@ -191,12 +202,17 @@ def _search_by_keyword(
     keyword: str,
     days_back: int,
     max_results: int,
+    sort_by: str = "views",
 ) -> list[dict]:
     """
-    通过关键词搜索 YouTube 视频，按播放量排序，返回基础信息（不含字幕）。
+    通过关键词搜索 YouTube 视频，支持按热度/时间排序，返回基础信息（不含字幕）。
+    两种排序模式都先多拉候选（max_results * 3）再本地筛选。
     """
+    sort_by = _normalize_sort_by(sort_by, "search_sort_by")
     cutoff = datetime.now(timezone.utc) - timedelta(days=days_back)
     published_after = cutoff.strftime("%Y-%m-%dT%H:%M:%SZ")
+    search_order = "viewCount" if sort_by == "views" else "date"
+    fetch_count = min(max_results * 3, 50)
 
     raw_videos: list[dict] = []
     try:
@@ -204,9 +220,9 @@ def _search_by_keyword(
             q=keyword,
             part="snippet",
             type="video",
-            order="viewCount",
+            order=search_order,
             publishedAfter=published_after,
-            maxResults=min(max_results * 3, 50),
+            maxResults=fetch_count,
         )
         for item in resp.get("items", []):
             video_id = item.get("id", {}).get("videoId", "")
@@ -229,12 +245,16 @@ def _search_by_keyword(
     if not raw_videos:
         return []
 
-    # 批量拉播放量，二次排序
-    video_ids = [v["video_id"] for v in raw_videos]
-    stats = _get_video_stats(yt, video_ids)
-    for v in raw_videos:
-        v["view_count"] = stats.get(v["video_id"], 0)
-    raw_videos.sort(key=lambda x: x["view_count"], reverse=True)
+    if sort_by == "views":
+        # 批量拉播放量，二次排序
+        video_ids = [v["video_id"] for v in raw_videos]
+        stats = _get_video_stats(yt, video_ids)
+        for v in raw_videos:
+            v["view_count"] = stats.get(v["video_id"], 0)
+        raw_videos.sort(key=lambda x: x["view_count"], reverse=True)
+    else:
+        # date 模式也执行本地二次筛选，保证“多拉再筛”行为一致
+        raw_videos.sort(key=lambda x: x.get("published_at", ""), reverse=True)
 
     results: list[dict] = []
     for v in raw_videos[:max_results]:
@@ -330,10 +350,14 @@ def collect_youtube(
     yt = YouTubeClient(api_key)
     max_per_channel = yt_cfg.get("max_results_per_channel", 5)
     days_back = yt_cfg.get("days_lookback", 3)
-    sort_by = yt_cfg.get("sort_by", "views")
+    sort_by = _normalize_sort_by(yt_cfg.get("sort_by", "views"), "sort_by")
     channel_ids = yt_cfg.get("channel_ids", [])
     enable_keyword_search = yt_cfg.get("enable_keyword_search", False)
     max_search_results = yt_cfg.get("max_search_results", 10)
+    search_sort_by = _normalize_sort_by(
+        yt_cfg.get("search_sort_by", sort_by),
+        "search_sort_by",
+    )
     # 关键词搜索单独的时间窗口（热点时效性更短，默认比订阅频道窗口小）
     search_days_back = yt_cfg.get("search_days_lookback", days_back)
 
@@ -362,7 +386,13 @@ def collect_youtube(
             logger.info(f"   关键词: {keywords}")
             search_added = 0
             for kw in keywords:
-                videos = _search_by_keyword(yt, kw, search_days_back, max_results=max_search_results)
+                videos = _search_by_keyword(
+                    yt,
+                    kw,
+                    search_days_back,
+                    max_results=max_search_results,
+                    sort_by=search_sort_by,
+                )
                 for v in videos:
                     if v["url"] not in seen_urls:
                         seen_urls.add(v["url"])

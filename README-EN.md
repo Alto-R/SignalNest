@@ -38,7 +38,7 @@ A self-hosted personal AI digest service — aggregates GitHub / YouTube / RSS, 
 - **Focus-based filtering**: each schedule has a `focus` field; the AI prioritizes content that matches it
 - **Two-stage AI pipeline**: batch title filtering (low token cost) → deep read scoring (only for selected items)
 - **Per-source minimums**: configurable minimum item counts per source (default GitHub≥5, YouTube≥2) to reduce source imbalance
-- **YouTube dual-track**: subscribed channels ranked by views + AI auto-generates search keywords from `focus` to discover other channels
+- **YouTube dual-track**: subscribed channels support views/newest ordering + AI auto-generates search keywords from `focus` to discover other channels
 - **Preference learning**: rate items to teach the AI your taste — recommendations improve over time
 - **Personal assistant**: morning schedule reminder + TODO due-date checker (overdue / today / upcoming)
 - **Multi-channel delivery**: Email (HTML) + Feishu + WeCom, with per-recipient content splitting
@@ -290,16 +290,18 @@ collectors:
     channel_ids:
       - "UCnUYZLuoy1rq1aVMwx4aTzw"   # Lex Fridman Podcast
       - "UCcefcZRL2oaA_uBNeo5UOWg"   # Y Combinator
-    max_results_per_channel: 3   # Videos kept per channel (sorted by views)
+    max_results_per_channel: 3   # Final videos kept per channel (based on sort_by)
     days_lookback: 7             # Only fetch videos from the last N days
     sort_by: "views"             # "views" (popularity) / "date" (newest first)
     # ── Track 2: AI keyword search (other channels) ───────────
     enable_keyword_search: true  # Adds one AI call + YouTube Search API quota
-    max_search_results: 3        # Max videos per keyword (sorted by views)
+    search_sort_by: "views"      # Track 2 ordering: "views" (popularity) / "date" (newest first)
+    max_search_results: 3        # Max videos per keyword
     search_days_lookback: 3      # Time window for keyword search (independent of channel window)
 ```
 
 When `enable_keyword_search` is enabled, the AI derives 3–5 English search phrases from the current schedule's `focus` and queries the YouTube Search API to surface content beyond your subscribed channels.
+In Track 2, both `search_sort_by: "views"` and `search_sort_by: "date"` first fetch `max_search_results * 3` candidates, then apply local selection and keep the top `max_search_results` items.
 
 ### RSS feeds
 

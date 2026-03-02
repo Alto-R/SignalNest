@@ -87,13 +87,14 @@ collectors:
       - "UCnUYZLuoy1rq1aVMwx4aTzw"   # Lex Fridman Podcast
       - "UCcefcZRL2oaA_uBNeo5UOWg"   # Y Combinator
       - "UC9cn0TuPq4dnbTY-CBsm8XA"   # a16z
-    max_results_per_channel: 3  # 每个频道最终保留的视频数（按热度排序）
+    max_results_per_channel: 3  # 每个频道最终保留的视频数
     days_lookback: 7            # 只抓取最近 N 天的视频
     sort_by: "views"            # 排序方式："views"（热度）/ "date"（最新）
     # ── 关键词搜索（其他频道）────────────────────────────────
     # AI 根据当次 schedule 的 focus 自动推导搜索词，覆盖 channel_ids 之外的内容
     enable_keyword_search: true  # 改为 true 开启；会额外消耗一次 AI 调用 + YouTube Search 配额
-    max_search_results: 3        # 每个关键词最多取多少条视频（按热度排序）
+    search_sort_by: "views"      # 路线②排序："views"（热度）/ "date"（最新）
+    max_search_results: 5        # 每个关键词最多取多少条视频
     search_days_lookback: 3      # 关键词搜索的时间窗口（热点时效性短，独立于订阅频道）
 
   # ── RSS ──────────────────────────────────────────────────────

@@ -38,7 +38,7 @@
 - **focus 定向筛选**：每个调度可设置今日关注方向，AI 优先推送与方向高度相关的内容
 - **两阶段 AI 处理**：先批量标题筛选（省 token），再对入选内容精读评分，高效又精准
 - **来源保底机制**：支持按来源设置最小条数（默认 GitHub≥5、YouTube≥2），减少单一来源“挤占”
-- **YouTube 双路采集**：订阅频道按热度排序 + AI 根据 focus 自动推导关键词搜索其他频道
+- **YouTube 双路采集**：订阅频道支持按热度/最新排序 + AI 根据 focus 自动推导关键词搜索其他频道
 - **偏好学习**：通过反馈打分，AI 逐渐学习你的内容偏好，推送越来越精准
 - **个人助手**：晨间日程提醒 + TODO 到期检查（逾期 / 今日 / 即将到期）
 - **多渠道推送**：邮件（HTML 富文本）+ 飞书 + 企业微信，按收件人分流内容
@@ -289,16 +289,18 @@ collectors:
     channel_ids:
       - "UCnUYZLuoy1rq1aVMwx4aTzw"   # Lex Fridman Podcast
       - "UCcefcZRL2oaA_uBNeo5UOWg"   # Y Combinator
-    max_results_per_channel: 3   # 每个频道按热度保留的视频数
+    max_results_per_channel: 3   # 每个频道最终保留的视频数（按 sort_by）
     days_lookback: 7             # 只抓最近 N 天的视频
     sort_by: "views"             # "views"（热度）/ "date"（最新）
     # ── 路线②：AI 关键词搜索（其他频道）─────────────────────
     enable_keyword_search: true  # 开启后会额外消耗一次 AI 调用 + Search 配额
+    search_sort_by: "views"      # 路线②排序："views"（热度）/ "date"（最新）
     max_search_results: 3        # 每个关键词最多取多少条视频
     search_days_lookback: 3      # 关键词搜索的时间窗口（独立于订阅频道，热点时效性更短）
 ```
 
 开启 `enable_keyword_search` 后，AI 会根据当次 `focus` 自动推导 3-5 个英文搜索词，通过 YouTube Search API 覆盖订阅频道之外的内容。
+Route 2 在 `search_sort_by: "views"` 和 `search_sort_by: "date"` 两种模式下，都会先拉取 `max_search_results * 3` 条候选，再做本地筛选后取前 `max_search_results` 条。
 
 ### RSS 订阅源
 
