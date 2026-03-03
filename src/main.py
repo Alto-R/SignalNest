@@ -105,6 +105,9 @@ def run_agent_for_schedule(schedule_name: str, config: dict, dry_run: bool = Fal
     """
     from src.agent.kernel import AgentRunOptions, run_agent_turn
 
+    # 与 legacy run() 对齐：先应用用户在 last_digest.json 中填写的反馈分数。
+    _apply_pending_feedback(config)
+
     schedule = _resolve_schedule(schedule_name, config)
     message = _build_agent_schedule_message(schedule, dry_run=dry_run)
 
@@ -137,6 +140,28 @@ def run_agent_for_schedule(schedule_name: str, config: dict, dry_run: bool = Fal
             raise RuntimeError("agent run finished without dispatch_notifications")
     elif not dry_run and not schedule_allow_side_effects:
         logger.warning("agent.schedule_allow_side_effects=false，已跳过通知发送校验")
+
+    # 与 legacy run() 保持一致：将本次新闻结果写入 last_digest 与 history 归档。
+    try:
+        from src.agent.session_store import AgentSessionStore
+
+        data_dir = Path(config.get("storage", {}).get("data_dir", "/app/data"))
+        session_store = AgentSessionStore(data_dir / "agent_sessions.db")
+        state = session_store.load_state(result["session_id"])
+        news_items = state.get("news_items", [])
+
+        if isinstance(news_items, list) and news_items:
+            tz = ZoneInfo(config.get("app", {}).get("timezone", "Asia/Shanghai"))
+            now = datetime.now(tz)
+            _save_last_digest(
+                news_items=news_items,
+                today=now.date(),
+                run_dt=now,
+                schedule_name=schedule.get("name", ""),
+                config=config,
+            )
+    except Exception as e:
+        logger.warning(f"agent 调度归档到 history 失败: {e}")
 
     return result
 
