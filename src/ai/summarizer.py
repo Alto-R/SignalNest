@@ -23,7 +23,7 @@ except ImportError:
     litellm = None  # type: ignore
 
 from src.ai.cli_backend import _call_ai
-from src.ai.feedback import load_taste_examples
+from src.ai.feedback import load_taste_examples, load_recent_titles
 
 logger = logging.getLogger(__name__)
 
@@ -173,6 +173,7 @@ def _batch_select_by_titles(
     language: str,
     max_keep: int,
     backend: str = "litellm",
+    history_titles: list[str] | None = None,
 ) -> list[int]:
     """
     第一阶段：仅凭标题+简介，一次 API 调用批量筛选值得深读的条目。
@@ -201,7 +202,16 @@ def _batch_select_by_titles(
             taste_hint += f"- {ex['title']}\n"
         taste_hint += "\n"
 
-    user_message = f"""{focus_line}{taste_hint}以下是 {len(items)} 条待筛选内容（格式：[序号] [来源] 标题  —  简介）：
+    history_hint = ""
+    if history_titles:
+        capped = history_titles[:200]
+        history_hint = "以下是过去7天已推送过的内容标题，请避免推荐语义上相似的内容：\n"
+        for t in capped:
+            history_hint += f"- {t}\n"
+        history_hint += "\n"
+        logger.info(f"  历史去重：加载 {len(capped)} 条历史标题到 Stage 1 提示词")
+
+    user_message = f"""{focus_line}{taste_hint}{history_hint}以下是 {len(items)} 条待筛选内容（格式：[序号] [来源] 标题  —  简介）：
 
 {items_text}
 请从中选出最多 {max_keep} 条最值得深度阅读的内容。
@@ -476,13 +486,14 @@ def summarize_items(
         call_kwargs["api_base"] = api_base
 
     taste_examples = load_taste_examples(config, limit=taste_limit)
+    history_titles = load_recent_titles(config, days=7)
 
     # ── 阶段一：标题批量筛选 ──────────────────────────────────
     # 预留 max_output 的 2 倍进入第二阶段，给评分留余量
     max_keep = min(max_output * 2, len(raw_items))
     selected_indices = _batch_select_by_titles(
         raw_items, focus, taste_examples, call_kwargs, language, max_keep,
-        backend=backend,
+        backend=backend, history_titles=history_titles,
     )
     selected_indices = _ensure_source_candidates(
         raw_items, selected_indices, source_minimums, max_keep
