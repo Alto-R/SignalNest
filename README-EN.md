@@ -39,20 +39,17 @@ A self-hosted personal AI digest system — scheduled aggregation from GitHub Tr
 - Preference learning: `user_score` in `data/last_digest.json` is persisted into `feedback.db`.
 - Multi-channel delivery: HTML email + Feishu webhook + WeCom webhook.
 - Privacy split: `EMAIL_FROM` keeps default personal blocks; other recipients get personal blocks only when matching named files exist, otherwise news-only.
-- Dual execution paths: `agent` (default) and `legacy`.
+- Agent-only execution path: local agent scheduling is the only runtime flow.
 
 ## 🏗️ Architecture Overview
 
 ```text
 Docker entrypoint (supercronic)
-  -> python -m src.main --agent-schedule-name <name>   # default
-  -> python -m src.main --schedule-name <name>         # legacy
+  -> python -m src.main --schedule-name <name>
 
-main.py
-  -> personal.ai_reader        (schedule/projects)
-  -> collectors.*              (github/youtube/rss)
-  -> ai.summarizer             (stage1 filter + stage2 summary)
-  -> notifications.dispatcher  (email/feishu/wework)
+main.py (agent-only)
+  -> agent.kernel            (LLM planning + tool calls + session persistence)
+  -> agent.tools             (collect/summarize/payload/dispatch tools)
   -> ai.feedback + data/history + data/last_digest.json
 ```
 
@@ -149,19 +146,11 @@ cp docker/.env.example .env
 
 For local runs, `src/config_loader.py` reads repository-root `.env` (not `docker/.env`).
 
-### Legacy flow
+### Agent-only flow
 
 ```bash
 python -m src.main --schedule-name "Morning Digest" --dry-run
 python -m src.main --schedule-name "Morning Digest"
-```
-
-### Agent flow
-
-```bash
-python -m src.main --agent-schedule-name "Morning Digest" --dry-run
-python -m src.main --agent-message "Collect today news and summarize" --agent-json
-python -m src.main --agent-tools-schema
 ```
 
 ## ⚙️ Configuration
@@ -202,12 +191,7 @@ Environment variables override `config.yaml`:
 - `RUN_MODE=cron` (default): parse `config.yaml`, generate crontab, keep running with supercronic.
 - `RUN_MODE=once`: execute one schedule and exit.
 
-Default schedule executor: `SCHEDULE_EXECUTOR=agent` (default set in entrypoint).
-
-- `agent` -> `python -m src.main --agent-schedule-name <name>`
-- `legacy` -> `python -m src.main --schedule-name <name>`
-
-> `docker/docker-compose.yml` does not expose `SCHEDULE_EXECUTOR` by default. Add it under `environment` if you want legacy mode in container runtime.
+Scheduler command is fixed to: `python -m src.main --schedule-name <name>` (agent-only).
 
 ## 🤖 Agent Mode
 
@@ -227,12 +211,13 @@ Agent core lives in `src/agent/`, following “LLM planning -> tool calls -> sta
 
 ### Policy and persistence
 
-- Tool policy: allowlist / denylist / `allow_side_effects`
+- Tool policy: allowlist / denylist / `allow_side_effects` (driven only by `config.agent.policy`)
 - Step config: `agent.max_steps` / `agent.schedule_max_steps`, uniformly capped by `agent.max_steps_hard_limit`
-- Schedule side-effect switch: `agent.schedule_allow_side_effects` (controls real sends in `--agent-schedule-name`)
+- Schedule side-effect switch: `agent.schedule_allow_side_effects` (controls real sends in `--schedule-name`)
 - Context lookback window: `agent.recent_turns_context_limit` (inject last N turns into planner prompt)
 - Session DB: `data/agent_sessions.db`
 - Scheduled runs are always persisted (fixed behavior, no user-facing toggle)
+- Config convergence: agent runtime parameters are centralized in `config.agent` with strict startup validation
 
 ## 🗂️ Data & Preference Learning
 
@@ -287,3 +272,4 @@ Inspired by:
 
 - [TrendRadar](https://github.com/sansan0/TrendRadar)
 - [obsidian-daily-digest](https://github.com/Lantern567/obsidian-daily-digest)
+

@@ -14,7 +14,10 @@ import os
 import re
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import datetime
+from difflib import SequenceMatcher
 from typing import Optional
+from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 try:
     import litellm
@@ -23,9 +26,250 @@ except ImportError:
     litellm = None  # type: ignore
 
 from src.ai.cli_backend import _call_ai
-from src.ai.feedback import load_taste_examples, load_recent_titles
+from src.ai.feedback import load_recent_history_records, load_taste_examples
 
 logger = logging.getLogger(__name__)
+
+_TRACKING_QUERY_KEYS = {
+    "spm",
+    "from",
+    "ref",
+    "source",
+    "fbclid",
+    "gclid",
+    "si",
+    "feature",
+    "mc_cid",
+    "mc_eid",
+}
+
+
+def _safe_positive_int(value, default: int) -> int:
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        return default
+    return parsed if parsed > 0 else default
+
+
+def _normalize_title(title: str) -> str:
+    text = str(title or "").strip().lower()
+    text = re.sub(r"\s+", " ", text)
+    # 仅去除两端噪声符号，保留中间内容用于严格匹配
+    text = re.sub(r"^[^\w\u4e00-\u9fff]+|[^\w\u4e00-\u9fff]+$", "", text)
+    return text
+
+
+def _normalize_url(url: str) -> str:
+    raw = str(url or "").strip()
+    if not raw:
+        return ""
+
+    try:
+        parsed = urlsplit(raw)
+    except Exception:
+        return raw.lower()
+
+    if not parsed.scheme and not parsed.netloc:
+        return raw.lower()
+
+    scheme = parsed.scheme.lower()
+    netloc = parsed.netloc.lower()
+    if scheme == "http" and netloc.endswith(":80"):
+        netloc = netloc[:-3]
+    if scheme == "https" and netloc.endswith(":443"):
+        netloc = netloc[:-4]
+
+    path = re.sub(r"/{2,}", "/", parsed.path or "/")
+    if path != "/":
+        path = path.rstrip("/")
+
+    cleaned_query: list[tuple[str, str]] = []
+    for k, v in parse_qsl(parsed.query, keep_blank_values=True):
+        key = str(k).strip()
+        key_lower = key.lower()
+        if key_lower.startswith("utm_") or key_lower in _TRACKING_QUERY_KEYS:
+            continue
+        cleaned_query.append((key, str(v).strip()))
+    cleaned_query.sort(key=lambda x: (x[0].lower(), x[1]))
+    query = urlencode(cleaned_query, doseq=True)
+
+    return urlunsplit((scheme, netloc, path, query, ""))
+
+
+def _title_similarity(a: str, b: str) -> float:
+    if not a or not b:
+        return 0.0
+    if a == b:
+        return 1.0
+    return SequenceMatcher(None, a, b).ratio()
+
+
+def _is_strict_title_duplicate(a: str, b: str) -> bool:
+    if not a or not b:
+        return False
+    if a == b:
+        return True
+    # 短标题要求完全一致，避免误判
+    if min(len(a), len(b)) < 20:
+        return False
+    return _title_similarity(a, b) >= 0.97
+
+
+def _parse_published_ts(value: str) -> float:
+    raw = str(value or "").strip()
+    if not raw:
+        return 0.0
+    try:
+        normalized = raw.replace("Z", "+00:00")
+        return datetime.fromisoformat(normalized).timestamp()
+    except Exception:
+        return 0.0
+
+
+def _item_completeness_score(item: dict) -> int:
+    score = 0
+    if _normalize_url(str(item.get("url", ""))):
+        score += 3
+    if str(item.get("title", "")).strip():
+        score += 2
+    if str(item.get("published_at", "")).strip():
+        score += 2
+    if str(item.get("description", "")).strip() or str(item.get("content_snippet", "")).strip():
+        score += 1
+    if str(item.get("feed_title", "")).strip() or str(item.get("channel", "")).strip():
+        score += 1
+    return score
+
+
+def _pick_better_item_index(items: list[dict], idx_a: int, idx_b: int) -> int:
+    a = items[idx_a]
+    b = items[idx_b]
+
+    key_a = (
+        _item_completeness_score(a),
+        _parse_published_ts(str(a.get("published_at", ""))),
+        -idx_a,
+    )
+    key_b = (
+        _item_completeness_score(b),
+        _parse_published_ts(str(b.get("published_at", ""))),
+        -idx_b,
+    )
+    return idx_a if key_a >= key_b else idx_b
+
+
+def _short_item_line(i: int, item: dict) -> str:
+    source = str(item.get("source", "unknown")).upper()
+    title = str(item.get("title", "")).replace("\n", " ").strip()
+    url = str(item.get("url", "")).strip()
+    published = str(item.get("published_at", "")).strip()
+    feed_or_channel = str(item.get("feed_title", "") or item.get("channel", "")).strip()
+    parts = [f"[{i}] [{source}] {title}"]
+    if url:
+        parts.append(f"url={url}")
+    if published:
+        parts.append(f"published_at={published}")
+    if feed_or_channel:
+        parts.append(f"meta={feed_or_channel}")
+    return " | ".join(parts)
+
+
+def _fallback_dedup_against_history(items: list[dict], history_records: list[dict]) -> list[int]:
+    history_urls: set[str] = set()
+    history_titles: list[str] = []
+    history_titles_set: set[str] = set()
+
+    for rec in history_records:
+        nurl = _normalize_url(str(rec.get("url", "")))
+        if nurl:
+            history_urls.add(nurl)
+        ntitle = _normalize_title(str(rec.get("title", "")))
+        if ntitle and ntitle not in history_titles_set:
+            history_titles.append(ntitle)
+            history_titles_set.add(ntitle)
+
+    kept: list[int] = []
+    dropped = 0
+    for idx, item in enumerate(items):
+        nurl = _normalize_url(str(item.get("url", "")))
+        ntitle = _normalize_title(str(item.get("title", "")))
+
+        is_dup = False
+        if nurl and nurl in history_urls:
+            is_dup = True
+        elif ntitle:
+            if ntitle in history_titles_set:
+                is_dup = True
+            else:
+                for h in history_titles:
+                    if _is_strict_title_duplicate(ntitle, h):
+                        is_dup = True
+                        break
+
+        if is_dup:
+            dropped += 1
+        else:
+            kept.append(idx)
+
+    logger.info(f"  历史去重（fallback）：{len(items)} → {len(kept)}（丢弃 {dropped}）")
+    return kept
+
+
+def _fallback_dedup_across_candidates(candidates: list[dict]) -> list[dict]:
+    if len(candidates) <= 1:
+        return candidates
+
+    url_groups: dict[str, list[int]] = {}
+    for idx, item in enumerate(candidates):
+        nurl = _normalize_url(str(item.get("url", "")))
+        if not nurl:
+            continue
+        url_groups.setdefault(nurl, []).append(idx)
+
+    kept_indices: set[int] = set(range(len(candidates)))
+    for group in url_groups.values():
+        if len(group) <= 1:
+            continue
+        keep = group[0]
+        for idx in group[1:]:
+            keep = _pick_better_item_index(candidates, keep, idx)
+        for idx in group:
+            if idx != keep:
+                kept_indices.discard(idx)
+
+    ordered = sorted(kept_indices)
+    deduped_indices: list[int] = []
+    for idx in ordered:
+        candidate = candidates[idx]
+        ntitle = _normalize_title(str(candidate.get("title", "")))
+        merged = False
+        for pos, existing_idx in enumerate(deduped_indices):
+            existing_title = _normalize_title(str(candidates[existing_idx].get("title", "")))
+            if not _is_strict_title_duplicate(ntitle, existing_title):
+                continue
+            better = _pick_better_item_index(candidates, existing_idx, idx)
+            deduped_indices[pos] = better
+            merged = True
+            break
+        if not merged:
+            deduped_indices.append(idx)
+
+    deduped_indices = sorted(set(deduped_indices))
+    result = [candidates[i] for i in deduped_indices]
+    logger.info(f"  跨源去重（fallback）：{len(candidates)} → {len(result)}")
+    return result
+
+
+def _parse_json_dict(raw_text: str) -> dict | None:
+    json_match = re.search(r"\{[\s\S]*\}", raw_text or "")
+    if not json_match:
+        return None
+    try:
+        parsed = json.loads(json_match.group())
+    except json.JSONDecodeError:
+        return None
+    return parsed if isinstance(parsed, dict) else None
 
 
 def _build_system_prompt(taste_examples: list[dict], language: str = "zh", focus: str = "") -> str:
@@ -242,6 +486,234 @@ selected 数组填入值得保留的条目序号（0-based 整数）。"""
     return list(range(len(items)))
 
 
+def _ai_dedup_against_history(
+    items: list[dict],
+    history_records: list[dict],
+    call_kwargs: dict,
+    language: str,
+    backend: str = "litellm",
+) -> list[int]:
+    """
+    阶段 A：当前候选与历史记录比较，先做严格去重（title/url 短信息）。
+    """
+    if not items:
+        return []
+    if not history_records:
+        return list(range(len(items)))
+
+    capped_history = history_records[:200]
+    lang_label = "中文" if language == "zh" else "English"
+    items_text = "\n".join(_short_item_line(i, item) for i, item in enumerate(items))
+    history_text = "\n".join(
+        f"- [{idx}] {str(rec.get('title', '')).strip()} | "
+        f"url={str(rec.get('url', '')).strip()} | "
+        f"source={str(rec.get('source', '')).strip()}"
+        for idx, rec in enumerate(capped_history)
+    )
+
+    user_message = f"""请执行严格的历史去重判断（Strict Dedup）。
+
+规则：
+1) 优先以 URL 一致性判重：URL 规范化后相同则视为重复。
+2) URL 不同但标题几乎一致、且语义明显是同一条新闻时，才判重。
+3) 不要做主题级“泛化去重”（同主题不同新闻必须保留）。
+
+当前候选（{len(items)} 条）：
+{items_text}
+
+历史已推送（最近 7 天，{len(capped_history)} 条）：
+{history_text}
+
+请仅输出 JSON：
+{{
+  "kept": [0, 2, 5],
+  "dropped": [{{"index": 1, "reason": "same normalized url as history"}}]
+}}
+其中 kept 为保留的当前候选序号（0-based）。"""
+
+    try:
+        dedup_kwargs = {**call_kwargs, "max_tokens": 700}
+        messages = [
+            {"role": "system", "content": f"你是严格去重助手，请用{lang_label}思考，只输出 JSON。"},
+            {"role": "user", "content": user_message},
+        ]
+        raw_text = _call_ai(messages, backend, dedup_kwargs)
+        parsed = _parse_json_dict(raw_text)
+        if parsed and isinstance(parsed.get("kept"), list):
+            kept: list[int] = []
+            seen: set[int] = set()
+            for idx in parsed.get("kept", []):
+                if not isinstance(idx, int) or not (0 <= idx < len(items)):
+                    continue
+                if idx in seen:
+                    continue
+                seen.add(idx)
+                kept.append(idx)
+
+            dropped = parsed.get("dropped", [])
+            if (
+                not kept
+                and items
+                and not (isinstance(dropped, list) and len(dropped) >= len(items))
+            ):
+                logger.warning("  历史去重 AI 结果异常（kept 为空且无充分 dropped 信息），改用 fallback")
+                return _fallback_dedup_against_history(items, capped_history)
+
+            logger.info(
+                f"  历史去重（AI）：{len(items)} → {len(kept)} "
+                f"(history={len(capped_history)})"
+            )
+            return kept
+    except Exception as e:
+        logger.warning(f"历史去重 AI 失败，改用 fallback: {e}")
+
+    return _fallback_dedup_against_history(items, capped_history)
+
+
+def _ai_dedup_across_candidates(
+    candidates: list[dict],
+    focus: str,
+    call_kwargs: dict,
+    language: str,
+    backend: str = "litellm",
+) -> list[dict]:
+    """
+    阶段 B：标题筛选后、精读前做跨源去重。重复组由 AI 选择保留项。
+    """
+    if len(candidates) <= 1:
+        return candidates
+
+    lang_label = "中文" if language == "zh" else "English"
+    focus_line = f"用户关注方向：{focus}\n\n" if focus else ""
+    items_text = "\n".join(_short_item_line(i, item) for i, item in enumerate(candidates))
+    user_message = f"""{focus_line}请对以下候选做跨源去重，目标是去掉“同一新闻/同一事件”的重复条目。
+
+规则：
+1) URL 规范化后一致，视为重复。
+2) URL 不同但标题几乎一致且明显同一事件，可判为重复。
+3) 对每个重复组，必须选择 1 条“最值得保留”的代表项。
+4) 不要把“同主题但不同事件”的新闻误判成重复。
+
+候选列表（{len(candidates)} 条）：
+{items_text}
+
+请仅输出 JSON：
+{{
+  "keep": [0, 3, 4],
+  "groups": [
+    {{"keep": 0, "drop": [1, 2], "reason": "same event from different sources"}}
+  ]
+}}
+其中 keep 为最终保留的候选序号（0-based）。"""
+
+    try:
+        dedup_kwargs = {**call_kwargs, "max_tokens": 800}
+        messages = [
+            {"role": "system", "content": f"你是跨源去重助手，请用{lang_label}思考，只输出 JSON。"},
+            {"role": "user", "content": user_message},
+        ]
+        raw_text = _call_ai(messages, backend, dedup_kwargs)
+        parsed = _parse_json_dict(raw_text)
+        if parsed and isinstance(parsed.get("keep"), list):
+            keep: list[int] = []
+            seen: set[int] = set()
+            for idx in parsed.get("keep", []):
+                if not isinstance(idx, int) or not (0 <= idx < len(candidates)):
+                    continue
+                if idx in seen:
+                    continue
+                seen.add(idx)
+                keep.append(idx)
+
+            groups = parsed.get("groups", [])
+            if not keep and candidates:
+                logger.warning("  跨源去重 AI 结果异常（keep 为空），改用 fallback")
+                return _fallback_dedup_across_candidates(candidates)
+
+            logger.info(
+                f"  跨源去重（AI）：{len(candidates)} → {len(keep)} "
+                f"(groups={len(groups) if isinstance(groups, list) else 0})"
+            )
+            return [candidates[i] for i in keep]
+    except Exception as e:
+        logger.warning(f"跨源去重 AI 失败，改用 fallback: {e}")
+
+    return _fallback_dedup_across_candidates(candidates)
+
+
+def _ai_pick_fill_candidates(
+    current_candidates: list[dict],
+    remaining_pool: list[dict],
+    need_count: int,
+    focus: str,
+    call_kwargs: dict,
+    language: str,
+    backend: str = "litellm",
+) -> list[int]:
+    """
+    去重后候选不足时，从剩余池中补选“值得补全”的条目。
+    允许返回空列表（代表不建议补全）。
+    """
+    if need_count <= 0 or not remaining_pool:
+        return []
+
+    lang_label = "中文" if language == "zh" else "English"
+    current_preview = "\n".join(
+        f"- {str(item.get('title', '')).strip()}"
+        for item in current_candidates[:30]
+        if str(item.get("title", "")).strip()
+    )
+    pool = remaining_pool[:120]
+    pool_text = "\n".join(_short_item_line(i, item) for i, item in enumerate(pool))
+    focus_line = f"用户关注方向：{focus}\n\n" if focus else ""
+
+    user_message = f"""{focus_line}当前已入围 {len(current_candidates)} 条内容，仍缺 {need_count} 条以接近日报上限。
+请在“剩余候选池”中挑选最多 {need_count} 条值得补全的内容；如果没有明显值得补全的内容，可以返回空数组。
+
+当前已入围标题（用于避免重复）：
+{current_preview or "(none)"}
+
+剩余候选池（{len(pool)} 条）：
+{pool_text}
+
+请仅输出 JSON：
+{{
+  "supplement": [1, 5, 8],
+  "reason": "..."
+}}
+其中 supplement 为剩余候选池的序号（0-based）。"""
+
+    try:
+        pick_kwargs = {**call_kwargs, "max_tokens": 500}
+        messages = [
+            {"role": "system", "content": f"你是内容补全助手，请用{lang_label}思考，只输出 JSON。"},
+            {"role": "user", "content": user_message},
+        ]
+        raw_text = _call_ai(messages, backend, pick_kwargs)
+        parsed = _parse_json_dict(raw_text)
+        if parsed and isinstance(parsed.get("supplement"), list):
+            selected: list[int] = []
+            seen: set[int] = set()
+            for idx in parsed.get("supplement", []):
+                if not isinstance(idx, int) or not (0 <= idx < len(pool)):
+                    continue
+                if idx in seen:
+                    continue
+                seen.add(idx)
+                selected.append(idx)
+                if len(selected) >= need_count:
+                    break
+            logger.info(
+                f"  补全候选（AI）：pool={len(pool)} need={need_count} selected={len(selected)}"
+            )
+            return selected
+    except Exception as e:
+        logger.warning(f"补全候选 AI 失败，跳过补全: {e}")
+
+    logger.info(f"  补全候选（fallback）：pool={len(pool)} need={need_count} selected=0")
+    return []
+
+
 def _normalize_source_minimums(raw_cfg) -> dict[str, int]:
     """
     解析来源保底配置。
@@ -345,7 +817,12 @@ def _ensure_source_candidates(
 
 
 def _item_key(item: dict) -> str:
-    return item.get("url") or f"{item.get('source', 'unknown')}::{item.get('title', '')}"
+    normalized_url = _normalize_url(str(item.get("url", "")))
+    if normalized_url:
+        return normalized_url
+    source = str(item.get("source", "unknown")).strip().lower()
+    title = _normalize_title(str(item.get("title", "")))
+    return f"{source}::{title}"
 
 
 def _enforce_source_minimums(
@@ -460,10 +937,41 @@ def summarize_items(
 
     ai_cfg = config.get("ai", {})
     rss_cfg = config.get("collectors", {}).get("rss", {})
-    min_score = min_score or ai_cfg.get("min_relevance_score", 5)
-    max_output = max_output or ai_cfg.get("max_items_per_digest", 15)
+
+    min_score_default = _safe_positive_int(ai_cfg.get("min_relevance_score", 5), 5)
+    min_score = (
+        _safe_positive_int(min_score, min_score_default)
+        if min_score is not None
+        else min_score_default
+    )
+
+    default_cap = 15
+    raw_config_cap = ai_cfg.get("max_items_per_digest", default_cap)
+    config_cap = _safe_positive_int(raw_config_cap, default_cap)
+    if config_cap != raw_config_cap:
+        logger.warning(
+            f"ai.max_items_per_digest 非法({raw_config_cap!r})，回退默认值 {default_cap}"
+        )
+
+    if max_output is None:
+        requested_max = config_cap
+    else:
+        requested_max = _safe_positive_int(max_output, config_cap)
+        if requested_max != max_output:
+            logger.warning(f"max_output 参数非法({max_output!r})，回退配置上限 {config_cap}")
+    effective_max_output = min(requested_max, config_cap)
+
+    logger.info(
+        "  新闻筛选开始: "
+        f"raw_count={len(raw_items)} "
+        f"requested_max={requested_max} "
+        f"config_cap={config_cap} "
+        f"effective_cap={effective_max_output} "
+        f"min_score={min_score}"
+    )
+
     # RSS 每 feed 最多进入摘要阶段的条数
-    rss_per_feed_limit: int = rss_cfg.get("max_items_per_feed", 3)
+    rss_per_feed_limit: int = _safe_positive_int(rss_cfg.get("max_items_per_feed", 3), 3)
     model     = os.environ.get("AI_MODEL")     or ai_cfg.get("model", "openai/gpt-4o-mini")
     api_base  = os.environ.get("AI_API_BASE")  or ai_cfg.get("api_base") or None
     max_tokens = ai_cfg.get("max_tokens", 512)
@@ -475,7 +983,7 @@ def summarize_items(
     api_key = os.environ.get("AI_API_KEY", "")
     if backend == "litellm" and not api_key:
         logger.error("AI_API_KEY 未配置，跳过 AI 摘要（backend=litellm 需要 API key）")
-        return raw_items[:max_output]
+        return raw_items[:effective_max_output]
 
     call_kwargs: dict = dict(
         model=model,
@@ -486,21 +994,138 @@ def summarize_items(
         call_kwargs["api_base"] = api_base
 
     taste_examples = load_taste_examples(config, limit=taste_limit)
-    history_titles = load_recent_titles(config, days=7)
+    history_records = load_recent_history_records(config, days=7, limit=600)
+    history_titles = []
+    seen_history_titles: set[str] = set()
+    for rec in history_records:
+        title = str(rec.get("title", "")).strip()
+        if not title or title in seen_history_titles:
+            continue
+        seen_history_titles.add(title)
+        history_titles.append(title)
+        if len(history_titles) >= 120:
+            break
+
+    # ── 阶段 A：历史去重（title/url 短信息）──────────────────────
+    kept_indices_after_history = _ai_dedup_against_history(
+        raw_items,
+        history_records,
+        call_kwargs=call_kwargs,
+        language=language,
+        backend=backend,
+    )
+    items_after_history = [raw_items[i] for i in kept_indices_after_history]
+    logger.info(f"  after_history_dedup_count={len(items_after_history)}")
+    if not items_after_history:
+        logger.info(
+            "  新闻筛选完成: final_count=0 "
+            f"effective_cap={effective_max_output} requested_max={requested_max} config_cap={config_cap}"
+        )
+        return []
 
     # ── 阶段一：标题批量筛选 ──────────────────────────────────
-    # 预留 max_output 的 2 倍进入第二阶段，给评分留余量
-    max_keep = min(max_output * 2, len(raw_items))
+    # 预留 effective_max_output 的 2 倍进入第二阶段，给评分留余量
+    max_keep = min(effective_max_output * 2, len(items_after_history))
     selected_indices = _batch_select_by_titles(
-        raw_items, focus, taste_examples, call_kwargs, language, max_keep,
+        items_after_history,
+        focus,
+        taste_examples,
+        call_kwargs,
+        language,
+        max_keep,
         backend=backend, history_titles=history_titles,
     )
     selected_indices = _ensure_source_candidates(
-        raw_items, selected_indices, source_minimums, max_keep
+        items_after_history, selected_indices, source_minimums, max_keep
     )
-    candidates = [raw_items[i] for i in selected_indices]
+    candidates = [items_after_history[i] for i in selected_indices]
+    logger.info(f"  after_stage1_select_count={len(candidates)}")
+    if not candidates:
+        logger.info(
+            "  新闻筛选完成: final_count=0 "
+            f"effective_cap={effective_max_output} requested_max={requested_max} config_cap={config_cap}"
+        )
+        return []
 
-    # ── 阶段一后：为 YouTube 入选视频补充字幕（精读素材）────────
+    # ── 阶段 B：跨源去重（精读前）──────────────────────────────
+    candidates = _ai_dedup_across_candidates(
+        candidates,
+        focus=focus,
+        call_kwargs=call_kwargs,
+        language=language,
+        backend=backend,
+    )
+    logger.info(f"  after_cross_source_dedup_count={len(candidates)}")
+    if not candidates:
+        logger.info(
+            "  新闻筛选完成: final_count=0 "
+            f"effective_cap={effective_max_output} requested_max={requested_max} config_cap={config_cap}"
+        )
+        return []
+
+    # ── 阶段 B 后：RSS 每 feed 封顶 ────────────────────────────
+    # 去重后先做一次 RSS feed 封顶，得到可进入精读的基础池
+    feed_counts: dict[str, int] = {}
+    capped: list[dict] = []
+    for item in candidates:
+        if item.get("source") == "rss":
+            feed_key = item.get("feed_title", item.get("url", "unknown"))
+            feed_counts[feed_key] = feed_counts.get(feed_key, 0) + 1
+            if feed_counts[feed_key] > rss_per_feed_limit:
+                continue
+        capped.append(item)
+    if len(capped) < len(candidates):
+        logger.info(f"  RSS per-feed 封顶：{len(candidates)} → {len(capped)} 条进入摘要")
+    candidates = capped
+
+    # ── 去重后不足上限时：从剩余池补全候选（允许补不满）──────────
+    if len(candidates) < effective_max_output:
+        need_fill = effective_max_output - len(candidates)
+        existing_keys = {_item_key(item) for item in candidates}
+        remaining_pool = [
+            item for item in items_after_history
+            if _item_key(item) not in existing_keys
+        ]
+        fill_indices = _ai_pick_fill_candidates(
+            current_candidates=candidates,
+            remaining_pool=remaining_pool,
+            need_count=need_fill,
+            focus=focus,
+            call_kwargs=call_kwargs,
+            language=language,
+            backend=backend,
+        )
+        filled = 0
+        for idx in fill_indices:
+            if idx < 0 or idx >= len(remaining_pool):
+                continue
+            item = remaining_pool[idx]
+            key = _item_key(item)
+            if key in existing_keys:
+                continue
+            if item.get("source") == "rss":
+                feed_key = item.get("feed_title", item.get("url", "unknown"))
+                if feed_counts.get(feed_key, 0) >= rss_per_feed_limit:
+                    continue
+                feed_counts[feed_key] = feed_counts.get(feed_key, 0) + 1
+            candidates.append(item)
+            existing_keys.add(key)
+            filled += 1
+            if len(candidates) >= effective_max_output:
+                break
+        logger.info(
+            f"  after_fill_candidates_count={len(candidates)} "
+            f"(filled={filled}, need={need_fill})"
+        )
+
+    if not candidates:
+        logger.info(
+            "  新闻筛选完成: final_count=0 "
+            f"effective_cap={effective_max_output} requested_max={requested_max} config_cap={config_cap}"
+        )
+        return []
+
+    # ── 精读前：为 YouTube 入选视频补充字幕（仅对最终候选）────────
     yt_candidates = [item for item in candidates if item.get("source") == "youtube"]
     if yt_candidates:
         logger.info(f"  拉取 YouTube 字幕（{len(yt_candidates)} 个视频）...")
@@ -516,22 +1141,6 @@ def summarize_items(
                     item["transcript_snippet"] = _get_transcript(video_id)
         except Exception as e:
             logger.warning(f"YouTube 字幕补充失败: {e}")
-
-    # ── 阶段一后：RSS 每 feed 封顶 ────────────────────────────
-    # RSS 初始多抓了很多条（max_items_per_feed_initial），这里把每个 feed 的候选
-    # 限制到 rss_per_feed_limit 条，防止单个 feed 占满摘要名额
-    feed_counts: dict[str, int] = {}
-    capped: list[dict] = []
-    for item in candidates:
-        if item.get("source") == "rss":
-            feed_key = item.get("feed_title", item.get("url", "unknown"))
-            feed_counts[feed_key] = feed_counts.get(feed_key, 0) + 1
-            if feed_counts[feed_key] > rss_per_feed_limit:
-                continue
-        capped.append(item)
-    if len(capped) < len(candidates):
-        logger.info(f"  RSS per-feed 封顶：{len(candidates)} → {len(capped)} 条进入摘要")
-    candidates = capped
 
     # ── 阶段二：并行完整评分+摘要 ─────────────────────────────
     system_prompt = _build_system_prompt(taste_examples, language, focus=focus)
@@ -555,6 +1164,7 @@ def summarize_items(
             elif low is not None:
                 low_score_pool.append(low)
 
+    logger.info(f"  after_stage2_score_count={len(results)}")
     results.sort(key=lambda x: x.get("ai_score", 0), reverse=True)
 
     # 按来源分桶，每源保底
@@ -566,7 +1176,11 @@ def summarize_items(
             source_buckets[src] = []
         source_buckets[src].append(item)
 
-    per_source_min = max_output // len(source_buckets) if source_buckets else max_output
+    per_source_min = (
+        effective_max_output // len(source_buckets)
+        if source_buckets
+        else effective_max_output
+    )
 
     selected: list[dict] = []
     leftover: list[dict] = []
@@ -574,7 +1188,7 @@ def summarize_items(
         selected.extend(items[:per_source_min])
         leftover.extend(items[per_source_min:])
 
-    remaining = max_output - len(selected)
+    remaining = effective_max_output - len(selected)
     if remaining > 0 and leftover:
         leftover.sort(key=lambda x: x.get("ai_score", 0), reverse=True)
         selected.extend(leftover[:remaining])
@@ -584,10 +1198,18 @@ def summarize_items(
         high_score_items=results,
         low_score_items=low_score_pool,
         source_minimums=source_minimums,
-        max_output=max_output,
+        max_output=effective_max_output,
     )
-    selected.sort(key=lambda x: x.get("ai_score", 0), reverse=True)
-    return selected
+    final_items = selected[:effective_max_output]
+    final_items.sort(key=lambda x: x.get("ai_score", 0), reverse=True)
+    logger.info(
+        "  新闻筛选完成: "
+        f"final_count={len(final_items)} "
+        f"effective_cap={effective_max_output} "
+        f"requested_max={requested_max} "
+        f"config_cap={config_cap}"
+    )
+    return final_items
 
 
 def generate_digest_summary(

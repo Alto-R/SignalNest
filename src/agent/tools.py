@@ -5,6 +5,7 @@ Tool registry for SignalNest local agent.
 from __future__ import annotations
 
 import copy
+import logging
 from dataclasses import dataclass
 from datetime import date, datetime
 from pathlib import Path
@@ -19,6 +20,7 @@ from src.notifications.dispatcher import dispatch
 from src.personal.ai_reader import read_active_projects, read_today_schedule
 
 ToolHandler = Callable[[dict[str, Any], "ToolRuntime"], dict[str, Any]]
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -176,14 +178,33 @@ def _tool_summarize_news(args: dict[str, Any], rt: ToolRuntime) -> dict[str, Any
     if not raw_items:
         raise ValueError("state.raw_items is empty; run a collect tool first")
 
+    ai_cfg = rt.config.get("ai", {})
+    raw_cap = ai_cfg.get("max_items_per_digest", 15)
+    try:
+        config_cap = int(raw_cap)
+        if config_cap <= 0:
+            raise ValueError("non-positive cap")
+    except Exception:
+        config_cap = 15
+        logger.warning("summarize_news: invalid ai.max_items_per_digest=%r, fallback=15", raw_cap)
+
     focus = args.get("focus", "")
+
     news_items = summarize_items(
         raw_items,
         rt.config,
         min_score=args.get("min_score"),
-        max_output=args.get("max_output"),
+        max_output=None,
         focus=focus,
     )
+    if len(news_items) > config_cap:
+        logger.warning(
+            "summarize_news: defensive clamp triggered %s -> %s by config cap",
+            len(news_items),
+            config_cap,
+        )
+        news_items = news_items[:config_cap]
+
     digest_summary = generate_digest_summary(news_items, rt.config, focus=focus)
 
     rt.state["news_items"] = news_items
@@ -249,8 +270,8 @@ def _tool_build_digest_payload(args: dict[str, Any], rt: ToolRuntime) -> dict[st
         content_blocks.append("news")
 
     payload = {
-        "schedule_name": args.get("schedule_name", "Agent Session"),
-        "subject_prefix": args.get("subject_prefix", "SignalNest Agent"),
+        "schedule_name": args["schedule_name"],
+        "subject_prefix": args["subject_prefix"],
         "focus": args.get("focus", ""),
         "date": today,
         "datetime": now,
@@ -384,7 +405,6 @@ def build_agent_tools() -> dict[str, ToolSpec]:
                 "properties": {
                     "focus": {"type": "string", "default": ""},
                     "min_score": {"type": "integer", "minimum": 1, "maximum": 10},
-                    "max_output": {"type": "integer", "minimum": 1, "maximum": 100},
                 },
                 "additionalProperties": False,
             },
@@ -421,10 +441,11 @@ def build_agent_tools() -> dict[str, ToolSpec]:
             input_schema={
                 "type": "object",
                 "properties": {
-                    "schedule_name": {"type": "string", "default": "Agent Session"},
-                    "subject_prefix": {"type": "string", "default": "SignalNest Agent"},
+                    "schedule_name": {"type": "string"},
+                    "subject_prefix": {"type": "string"},
                     "focus": {"type": "string", "default": ""},
                 },
+                "required": ["schedule_name", "subject_prefix"],
                 "additionalProperties": False,
             },
             handler=_tool_build_digest_payload,
@@ -442,33 +463,3 @@ def build_agent_tools() -> dict[str, ToolSpec]:
         ),
     ]
     return {t.name: t for t in tools}
-
-
-def export_tools_schema(tools: dict[str, ToolSpec]) -> dict[str, Any]:
-    return {
-        "type": "object",
-        "properties": {
-            "tools": {
-                "type": "array",
-                "items": {
-                    "type": "object",
-                    "properties": {
-                        "name": {"type": "string"},
-                        "description": {"type": "string"},
-                        "side_effect": {"type": "boolean"},
-                        "input_schema": {"type": "object"},
-                    },
-                    "required": ["name", "description", "side_effect", "input_schema"],
-                },
-            }
-        },
-        "tool_definitions": [
-            {
-                "name": tool.name,
-                "description": tool.description,
-                "side_effect": tool.side_effect,
-                "input_schema": tool.input_schema,
-            }
-            for tool in tools.values()
-        ],
-    }

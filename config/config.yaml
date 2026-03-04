@@ -190,22 +190,24 @@ ai:
 # ──────────────────────────────────────────────────────────────
 agent:
   # 单次 agent 运行最大工具步数（会被 max_steps_hard_limit 裁剪）
-  # 适用于：
-  # - `python -m src.main --agent-message ...`
-  # - `python -m src.main --agent-schedule-name ...`（当 schedule_max_steps 未设置时）
+  # 适用于 agent-only 调度路径：`python -m src.main --schedule-name ...`
   max_steps: 6
-  # agent 工具步数硬上限（统一在配置中定义，不在代码里写死）
-  max_steps_hard_limit: 20
-  # 可选：专门覆盖定时调度（--agent-schedule-name）的最大步数
-  # 留空则回退到 max_steps
+  # 调度专用最大步数（必须显式配置，不再回退到 max_steps）
   schedule_max_steps: 8
-  # 定时调度（--agent-schedule-name）是否允许副作用工具（如发送通知）
+  # agent 工具步数硬上限（统一在配置中定义，不在业务代码里写死）
+  max_steps_hard_limit: 20
+  # 定时调度（--schedule-name）是否允许副作用工具（如发送通知）
   schedule_allow_side_effects: true
+  # 若开启，非 dry-run 时必须出现 dispatch_notifications 调用成功
+  require_dispatch_tool_call: true
+  # 兜底总结回复的 token 上限（planner 未输出 final 时使用）
+  fallback_response_max_tokens: 800
+  # 会话标题模板：支持 {schedule_name} 占位符
+  session_title_template: "Scheduled Push | {schedule_name}"
   # 跨轮上下文注入最近多少轮对话摘要（越大越耗 token）
   recent_turns_context_limit: 6
 
-  # 工具策略（主要影响 --agent-message 交互模式）
-  # 注意：定时调度路径默认使用 schedule_allow_side_effects=true
+  # 工具策略（agent 内核统一从这里读取，不再接受 CLI 覆盖）
   policy:
     # 允许清单：留空表示不启用白名单限制
     allow_tools: []

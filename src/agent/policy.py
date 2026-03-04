@@ -29,27 +29,12 @@ class ToolPolicy:
     def from_config(
         cls,
         config: dict,
-        *,
-        allow_side_effects_override: bool | None = None,
-        allow_tools_override: list[str] | None = None,
-        deny_tools_override: list[str] | None = None,
     ) -> "ToolPolicy":
-        agent_cfg = config.get("agent", {})
-        policy_cfg = agent_cfg.get("policy", {})
+        policy_cfg = config["agent"]["policy"]
 
-        cfg_allow_tools = policy_cfg.get("allow_tools", [])
-        cfg_deny_tools = policy_cfg.get("deny_tools", [])
-        cfg_allow_side_effects = bool(policy_cfg.get("allow_side_effects", False))
-
-        allow_tools_raw = (
-            allow_tools_override if allow_tools_override is not None else cfg_allow_tools
-        )
-        deny_tools_raw = deny_tools_override if deny_tools_override is not None else cfg_deny_tools
-        allow_side_effects = (
-            allow_side_effects_override
-            if allow_side_effects_override is not None
-            else cfg_allow_side_effects
-        )
+        allow_tools_raw = policy_cfg["allow_tools"]
+        deny_tools_raw = policy_cfg["deny_tools"]
+        allow_side_effects = bool(policy_cfg["allow_side_effects"])
 
         allow_tools = {str(x).strip() for x in allow_tools_raw if str(x).strip()}
         deny_tools = {str(x).strip() for x in deny_tools_raw if str(x).strip()}
@@ -74,4 +59,3 @@ class ToolPolicy:
             )
 
         return True, None
-

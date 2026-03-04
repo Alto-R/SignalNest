@@ -14,6 +14,7 @@ import sqlite3
 import logging
 from datetime import datetime, timedelta
 from pathlib import Path
+from typing import Any
 
 logger = logging.getLogger(__name__)
 
@@ -73,17 +74,12 @@ def load_taste_examples(config: dict, limit: int = 8) -> list[dict]:
     ]
 
 
-def load_recent_titles(config: dict, days: int = 30) -> list[str]:
-    """读取最近 N 天历史摘要中出现过的标题，用于 Stage 1 去重提示。"""
-    data_dir = Path(config.get("storage", {}).get("data_dir", "/app/data"))
-    history_dir = data_dir / "history"
-    if not history_dir.exists():
-        return []
-
+def _collect_recent_history_files(history_dir: Path, days: int) -> list[tuple[Path, datetime]]:
+    """收集最近 N 天 history 文件，按文件名时间倒序（新→旧）。"""
     cutoff = datetime.now() - timedelta(days=days)
-    titles: list[str] = []
+    matched: list[tuple[Path, datetime]] = []
 
-    for f in sorted(history_dir.glob("digest_*.json")):
+    for f in history_dir.glob("digest_*.json"):
         m = re.match(r"digest_(\d{8})_", f.name)
         if not m:
             continue
@@ -93,14 +89,68 @@ def load_recent_titles(config: dict, days: int = 30) -> list[str]:
             continue
         if file_date < cutoff:
             continue
+        matched.append((f, file_date))
+
+    matched.sort(key=lambda x: x[0].name, reverse=True)
+    return matched
+
+
+def load_recent_history_records(
+    config: dict,
+    days: int = 30,
+    limit: int = 500,
+) -> list[dict[str, Any]]:
+    """
+    读取最近 N 天历史摘要中的轻量记录，用于去重（title/url/source/date）。
+
+    Returns:
+        [
+          {"title": "...", "url": "...", "source": "...", "date": "YYYY-MM-DD"},
+          ...
+        ]
+    """
+    if limit <= 0:
+        return []
+
+    data_dir = Path(config.get("storage", {}).get("data_dir", "/app/data"))
+    history_dir = data_dir / "history"
+    if not history_dir.exists():
+        return []
+
+    records: list[dict[str, Any]] = []
+    for f, file_date in _collect_recent_history_files(history_dir, days):
         try:
             items = json.loads(f.read_text(encoding="utf-8"))
+            if not isinstance(items, list):
+                continue
             for item in items:
-                title = item.get("title", "").strip()
-                if title:
-                    titles.append(title)
+                if not isinstance(item, dict):
+                    continue
+                title = str(item.get("title", "")).strip()
+                url = str(item.get("url", "")).strip()
+                if not title and not url:
+                    continue
+                source = str(item.get("source", "")).strip().lower()
+                records.append(
+                    {
+                        "title": title,
+                        "url": url,
+                        "source": source,
+                        "date": file_date.strftime("%Y-%m-%d"),
+                    }
+                )
+                if len(records) >= limit:
+                    return records
         except Exception:
             continue
+
+    return records
+
+
+def load_recent_titles(config: dict, days: int = 30) -> list[str]:
+    """读取最近 N 天历史摘要中出现过的标题（兼容旧调用）。"""
+    records = load_recent_history_records(config, days=days, limit=2000)
+    titles = [str(r.get("title", "")).strip() for r in records if str(r.get("title", "")).strip()]
 
     # 去重并保留顺序
     seen: set[str] = set()

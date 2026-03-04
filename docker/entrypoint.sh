@@ -11,17 +11,8 @@ fi
 # 保存环境变量，确保 cron 任务可以继承
 env >> /etc/environment
 
-# 调度执行器：
-# - agent（默认）：通过本地 agent kernel 执行
-# - legacy：走历史主流程 run(schedule)
-SCHEDULE_EXECUTOR="${SCHEDULE_EXECUTOR:-agent}"
-if [ "${SCHEDULE_EXECUTOR}" = "agent" ]; then
-    SCHEDULE_ARG="--agent-schedule-name"
-    echo "🤖 调度执行器: agent"
-else
-    SCHEDULE_ARG="--schedule-name"
-    echo "⚙️ 调度执行器: legacy"
-fi
+SCHEDULE_ARG="--schedule-name"
+echo "🤖 调度执行器: agent-only"
 
 case "${RUN_MODE:-cron}" in
 

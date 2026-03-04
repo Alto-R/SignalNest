@@ -33,9 +33,7 @@ class AgentRunOptions:
     session_id: str | None = None
     max_steps: int | None = None
     dry_run: bool = False
-    allow_side_effects: bool | None = None
-    allow_tools: list[str] | None = None
-    deny_tools: list[str] | None = None
+    session_title: str | None = None
 
 
 def _build_call_kwargs(config: dict) -> tuple[str, dict]:
@@ -256,6 +254,7 @@ def _synthesize_fallback_response(
     step_history: list[dict[str, Any]],
     backend: str,
     call_kwargs: dict,
+    max_tokens: int,
 ) -> str:
     synth_messages = [
         {
@@ -272,7 +271,7 @@ def _synthesize_fallback_response(
         },
     ]
     try:
-        text = _call_ai(synth_messages, backend, {**call_kwargs, "max_tokens": 800})
+        text = _call_ai(synth_messages, backend, {**call_kwargs, "max_tokens": max_tokens})
         return _normalize_final_text(text)
     except Exception:
         if not step_history:
@@ -296,29 +295,32 @@ def run_agent_turn(
     if not message:
         raise ValueError("agent message is empty")
 
+    agent_cfg = config["agent"]
     tools = build_agent_tools()
-    policy = ToolPolicy.from_config(
-        config,
-        allow_side_effects_override=options.allow_side_effects,
-        allow_tools_override=options.allow_tools,
-        deny_tools_override=options.deny_tools,
-    )
+    policy = ToolPolicy.from_config(config)
 
     data_dir = Path(config.get("storage", {}).get("data_dir", "data"))
     session_db = data_dir / "agent_sessions.db"
     store = AgentSessionStore(session_db)
 
     session_id = options.session_id or str(uuid4())
-    store.ensure_session(session_id, title="SignalNest Local Agent Session")
+    if options.session_title:
+        session_title = options.session_title
+    else:
+        try:
+            session_title = str(agent_cfg["session_title_template"]).format(schedule_name="")
+        except Exception:
+            session_title = str(agent_cfg["session_title_template"])
+    store.ensure_session(session_id, title=session_title)
     state = store.load_state(session_id)
-    recent_turns_limit = int(config.get("agent", {}).get("recent_turns_context_limit", 6))
+    recent_turns_limit = int(agent_cfg["recent_turns_context_limit"])
     recent_turns_limit = max(1, recent_turns_limit)
     recent_turns = store.load_recent_turns(session_id, limit=recent_turns_limit)
 
-    agent_cfg = config.get("agent", {})
     default_max_steps = int(agent_cfg["max_steps"])
     hard_limit = int(agent_cfg["max_steps_hard_limit"])
     hard_limit = max(1, hard_limit)
+    fallback_max_tokens = int(agent_cfg["fallback_response_max_tokens"])
     requested_max_steps = options.max_steps if options.max_steps is not None else default_max_steps
     max_steps = int(requested_max_steps)
     max_steps = max(1, min(max_steps, hard_limit))
@@ -463,6 +465,7 @@ def run_agent_turn(
                 step_history=step_history,
                 backend=backend,
                 call_kwargs=call_kwargs,
+                max_tokens=fallback_max_tokens,
             )
     except Exception as e:
         status = "error"
